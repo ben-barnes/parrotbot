@@ -35,6 +35,7 @@ data Term
   | K
   | I
   | A Term Term
+    deriving (Eq, Ord)
 
 isApplication :: Term -> Bool
 isApplication (A _ _) = True
