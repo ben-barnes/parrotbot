@@ -1,6 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-
 module Parrotbot.API (
   Token(..)
 , parrotApplication
@@ -38,62 +37,22 @@ import Network.Wai (
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import qualified Data.Text as Text
 
-data EventWrapper
-  = EventWrapperChallenge ChallengeRequest
-  | EventWrapperEvent Event
+data SlackEvent
+  = SlackChallenge Challenge
+  | SlackEvent EventWrapper
     deriving (Eq, Ord)
 
-data Event
-  = EventAppMention AppMention
-    deriving (Eq, Ord)
-
-instance FromJSON Event where
-  parseJSON v = withObject "Event" (\v' ->
+instance FromJSON SlackEvent where
+  parseJSON v = withObject "SlackEvent" (\v' ->
     v' .: "type" >>= \tpe -> case tpe of
-      "app_mention" -> EventAppMention <$> (v' .: "event" >>= parseJSON)
-      _             -> fail $ "Invalid event type: " ++ (Text.unpack tpe)
+      "url_verification" -> SlackChallenge <$> parseJSON v
+      "event_callback"   -> SlackEvent     <$> parseJSON v
+      _ -> fail $ "Event type not recognised: " ++ (Text.unpack tpe)
     ) v
-      
-data AppMention = AppMention {
-  appMentionUser :: User
-, appMentionText :: MessageText
-, appMentionChannel :: Channel
-} deriving (Eq, Ord)
 
-instance FromJSON AppMention where
-  parseJSON = withObject "AppMention" $ \v -> AppMention
-    <$> v .: "user"
-    <*> v .: "text"
-    <*> v .: "channel"
-
-newtype User = User {
-  getUser :: Text
-} deriving (Eq, Ord)
-
-instance FromJSON User where
-  parseJSON = fmap User . parseJSON
-
-newtype MessageText = MessageText {
-  getMessageText :: Text
-} deriving (Eq, Ord)
-
-instance FromJSON MessageText where
-  parseJSON = fmap MessageText . parseJSON
-
-newtype Channel = Channel {
-  getChannel :: Text
-} deriving (Eq, Ord)
-
-instance FromJSON Channel where
-  parseJSON = fmap Channel . parseJSON
-
-instance FromJSON EventWrapper where
-  parseJSON v = withObject "EventWrapper" (\v' ->
-    v' .: "type" >>= \tpe -> case tpe of
-      "url_verification" -> EventWrapperChallenge <$> parseJSON v
-      "event_callback"   -> EventWrapperEvent <$> parseJSON v
-      _                  -> fail $ "Invalid event wrapper type: " ++ (Text.unpack tpe)
-    ) v
+slackEventToken :: SlackEvent -> Token
+slackEventToken (SlackChallenge c) = challengeToken c
+slackEventToken (SlackEvent e)     = eventWrapperToken e
 
 newtype Token = Token {
   getToken :: Text
@@ -102,34 +61,64 @@ newtype Token = Token {
 instance FromJSON Token where
   parseJSON = fmap Token . parseJSON
 
-data ChallengeRequest = ChallengeRequest {
-  challengeRequestToken :: Token
-, challengeRequestChallengeString :: ChallengeString
+instance ToJSON Token where
+  toJSON = toJSON . getToken
+
+data Challenge = Challenge {
+  challengeToken :: Token
+, challengeContent :: Text
 } deriving (Eq, Ord)
 
-instance FromJSON ChallengeRequest where
-  parseJSON = withObject "ChallengeRequest" $ \v -> ChallengeRequest
+instance FromJSON Challenge where
+  parseJSON = withObject "Challenge" $ \v -> Challenge
     <$> v .: "token"
     <*> v .: "challenge"
 
 newtype ChallengeResponse = ChallengeResponse {
-  challengeResponseChallengeString :: ChallengeString
+  getChallengeResponse :: Text
 } deriving (Eq, Ord)
 
 instance ToJSON ChallengeResponse where
-  toJSON r = object [
-      "challenge" .= challengeResponseChallengeString r
-    ]
+  toJSON r = object ["challenge" .= getChallengeResponse r]
 
-newtype ChallengeString = ChallengeString {
-  getChallengeString :: Text
+data EventWrapper = EventWrapper {
+  eventWrapperToken :: Token
+, eventWrapperTeamId :: Text
+, eventWrapperApiAppId :: Text
+, eventWrapperEvent :: Event
+, eventWrapperType :: Text
 } deriving (Eq, Ord)
 
-instance FromJSON ChallengeString where
-  parseJSON = fmap ChallengeString . parseJSON
+instance FromJSON EventWrapper where
+  parseJSON = withObject "EventWrapper" $ \v -> EventWrapper
+    <$> v .: "token"
+    <*> v .: "team_id"
+    <*> v .: "api_app_id"
+    <*> v .: "event"
+    <*> v .: "type"
 
-instance ToJSON ChallengeString where
-  toJSON = toJSON . getChallengeString
+data Event
+  = AppMentionEvent AppMention
+    deriving (Eq, Ord)
+
+instance FromJSON Event where
+  parseJSON v = withObject "Event" (\v' ->
+    v' .: "type" >>= \tpe -> case tpe of
+      "app_mention" -> AppMentionEvent <$> parseJSON v
+      _ -> fail $ "Event type not recognised: " ++ (Text.unpack tpe)
+    ) v
+
+data AppMention = AppMention {
+  appMentionUser :: Text
+, appMentionText :: Text
+, appMentionChannel :: Text
+} deriving (Eq, Ord)
+
+instance FromJSON AppMention where
+  parseJSON = withObject "AppMention" $ \v -> AppMention
+    <$> v .: "user"
+    <*> v .: "text"
+    <*> v .: "channel"
 
 parrotApplication :: Token -> Application
 parrotApplication token request respond =
@@ -137,19 +126,39 @@ parrotApplication token request respond =
     then do
       body <- lazyRequestBody request
       case eitherDecode body of
-        Right e  -> respond $ parrotBot token e
+        Right e  -> parrotBot token e >>= respond
         Left err -> respond $ responseLBS badRequest400 [] $ BLC.pack err
     else respond $ responseLBS methodNotAllowed405 [] ""
 
-parrotBot :: Token -> EventWrapper -> Response
-parrotBot t (EventWrapperChallenge r) = challengeEvent t r
+parrotBot :: Token -> SlackEvent -> IO Response
+parrotBot t e = withValidEvent t e handleSlackEvent
 
-challengeEvent :: Token -> ChallengeRequest -> Response
-challengeEvent t r =
-  let requestToken    = challengeRequestToken r
-      challengeString = challengeRequestChallengeString r
-      response        = ChallengeResponse challengeString
-  in  if requestToken == t
-    then responseLBS ok200        [(hContentType, "application/json")] (encode response)
-    else responseLBS forbidden403 [] ""
+withValidEvent
+  :: (Applicative f)
+  => Token
+  -> SlackEvent
+  -> (SlackEvent -> f Response)
+  -> f Response
+withValidEvent t e withEvent =
+  if slackEventToken e == t
+    then withEvent e
+    else pure $ responseLBS forbidden403 [] ""
 
+handleSlackEvent :: SlackEvent -> IO Response
+handleSlackEvent (SlackChallenge c) = return $ handleChallenge c
+handleSlackEvent (SlackEvent e)     = handleEvent e
+
+handleChallenge :: Challenge -> Response
+handleChallenge r =
+  let content  = challengeContent r
+      response = ChallengeResponse content
+  in  responseLBS ok200 [(hContentType, "application/json")] (encode response)
+
+handleEvent :: EventWrapper -> IO Response
+handleEvent e = case eventWrapperEvent e of
+  AppMentionEvent a -> handleAppMention a
+
+handleAppMention :: AppMention -> IO Response
+handleAppMention a = do
+  putStrLn "Received app mention."
+  return $ responseLBS ok200 [] ""
