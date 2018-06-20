@@ -1,4 +1,3 @@
 dist
 result
-nicta-shm.token
-digital-ocean.token
+credentials/
