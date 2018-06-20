@@ -5,6 +5,8 @@ module Main (
 ) where
 
 import Data.Text (Text)
+import Network.Wai.Handler.Warp (run)
+import Parrotbot.API (Token(Token), parrotApplication)
 import Parrotbot.Language (
     parseAllParrot
   , parseAllSKI
@@ -26,11 +28,14 @@ import Web.Slack.Message (sendMessage)
 import qualified Data.Text as Text
 
 main :: IO ()
-main = do
-  args <- getArgs
-  case args of
-    [token] -> runBot (config token) parrotBot ()
-    _       -> hPutStr stderr "Usage: parrotbot slack-api-token"
+main = run 8080 (parrotApplication $ Token "")
+
+-- main :: IO ()
+-- main = do
+--   args <- getArgs
+--   case args of
+--     [token] -> runBot (config token) parrotBot ()
+--     _       -> hPutStr stderr "Usage: parrotbot slack-api-token"
 
 config :: String -> SlackConfig
 config token = SlackConfig { _slackApiToken =  token }
