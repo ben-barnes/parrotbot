@@ -23,20 +23,16 @@ in {
     # Parrotbot service
     systemd.services.parrotbot = {
       description = "Parrotbot Daemon";
-      enable = true;
       serviceConfig = {
-        Type = "forking";
-        ExecStart = ''
-          ${parrotbot}/bin/parrotbot\
-            --app-token $(cat /opt/parrotbot/slack-app.token)\
-            --bot-token $(cat /opt/parrotbot/slack-bot.token)
-          '';
-        ExecStop  = "pkill parrotbot";
+        Type = "simple";
+        ExecStart = "${parrotbot}/bin/parrotbot --app-token /opt/parrotbot/slack-app --bot-token /opt/parrotbot/slack-bot";
+        ExecStop  = "/run/current-system/sw/bin/pkill parrotbot";
         Restart = "on-failure";
       };
-      after =  [ "nixops-keys.service" ];
       wantedBy = [ "default.target" ];
     };
+
+    systemd.services.parrotbot.enable = true;
 
     networking.firewall.allowedTCPPorts = [ 80 443 ];
 
@@ -45,13 +41,13 @@ in {
     deployment.digitalOcean.region = "sgp1";
     deployment.digitalOcean.size = "1gb";
 
-    # Upload and persist Slack API token from local file.
-    deployment.keys."slack-app.token".text = builtins.readFile ./credentials/slack-app.token;
-    deployment.keys."slack-bot.token".text = builtins.readFile ./credentials/slack-bot.token;
-    systemd.services.nixops-keys.postStart = ''
-      mkdir -p /opt/parrotbot
-      cp /run/keys/slack-app.token /opt/parrotbot/
-      cp /run/keys/slack-bot.token /opt/parrotbot/
+    # Upload and persist Slack API tokens from local files.
+    deployment.keys."slack-app".text = builtins.readFile ./credentials/slack-app.token;
+    deployment.keys."slack-bot".text = builtins.readFile ./credentials/slack-bot.token;
+    systemd.services.nixops-keys.postStart =  ''
+      mkdir -p /opt/parrotbot/
+      cp /run/keys/slack-app /opt/parrotbot/
+      cp /run/keys/slack-bot /opt/parrotbot/
     '';
   };
 }

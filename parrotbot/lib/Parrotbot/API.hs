@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Parrotbot.API (
-  Token(..)
+  Config(..)
+, Token(..)
 , parrotApplication
 ) where
 
@@ -17,8 +18,26 @@ import Data.Aeson (
   , toJSON
   , withObject
   )
+import Data.Attoparsec.Text (
+    Parser
+  , char
+  , string
+  )
+import Data.Char (isAlphaNum)
+import Data.Maybe (fromMaybe)
+import Data.Semigroup ((<>))
 import Data.Text (Text)
-import Network.HTTP.Types.Header (hContentType)
+import Network.HTTP.Client (
+    Manager
+  , RequestBody(RequestBodyLBS)
+  , httpLbs
+  , method
+  , parseRequest
+  , requestBody
+  , requestHeaders
+  , responseBody
+  )
+import Network.HTTP.Types.Header (hAuthorization, hContentType)
 import Network.HTTP.Types.Method (methodPost)
 import Network.HTTP.Types.Status (
     badRequest400
@@ -33,9 +52,24 @@ import Network.Wai (
   , requestMethod
   , responseLBS
   )
+import Parrotbot.Language (
+    parseAllParrot
+  , parseAllSKI
+  , renderParrot
+  , renderSKI
+  , repl
+  )
 
+import qualified Data.Attoparsec.Text as Atto (takeWhile)
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text (encodeUtf8)
+
+data Config = Config {
+  configManager :: Manager
+, configAppToken :: Token
+, configBotToken :: Token
+}
 
 data SlackEvent
   = SlackChallenge Challenge
@@ -120,45 +154,90 @@ instance FromJSON AppMention where
     <*> v .: "text"
     <*> v .: "channel"
 
-parrotApplication :: Token -> Application
-parrotApplication token request respond =
+data AppMentionResponse = AppMentionResponse {
+  appMentionResponseChannel :: Text
+, appMentionResponseText :: Text
+} deriving (Eq, Ord)
+
+instance ToJSON AppMentionResponse where
+  toJSON r = object [
+      "channel" .= appMentionResponseChannel r
+    , "text"    .= appMentionResponseText r
+    ]
+
+parrotApplication :: Config -> Application
+parrotApplication config request respond =
   if requestMethod request == methodPost
     then do
       body <- lazyRequestBody request
+      BLC.putStrLn $ "Got message: " <> body
       case eitherDecode body of
-        Right e  -> parrotBot token e >>= respond
+        Right e  -> parrotBot config e >>= respond
         Left err -> respond $ responseLBS badRequest400 [] $ BLC.pack err
     else respond $ responseLBS methodNotAllowed405 [] ""
 
-parrotBot :: Token -> SlackEvent -> IO Response
-parrotBot t e = withValidEvent t e handleSlackEvent
+parrotBot :: Config -> SlackEvent -> IO Response
+parrotBot c e = withValidEvent c e $ handleSlackEvent c
 
 withValidEvent
   :: (Applicative f)
-  => Token
+  => Config
   -> SlackEvent
   -> (SlackEvent -> f Response)
   -> f Response
-withValidEvent t e withEvent =
-  if slackEventToken e == t
+withValidEvent c e withEvent =
+  if slackEventToken e == configAppToken c
     then withEvent e
     else pure $ responseLBS forbidden403 [] ""
 
-handleSlackEvent :: SlackEvent -> IO Response
-handleSlackEvent (SlackChallenge c) = return $ handleChallenge c
-handleSlackEvent (SlackEvent e)     = handleEvent e
+handleSlackEvent :: Config -> SlackEvent -> IO Response
+handleSlackEvent c (SlackChallenge sc) = return $ handleChallenge sc
+handleSlackEvent c (SlackEvent e)     = handleEvent c e
 
 handleChallenge :: Challenge -> Response
 handleChallenge r =
   let content  = challengeContent r
       response = ChallengeResponse content
-  in  responseLBS ok200 [(hContentType, "application/json")] (encode response)
+  in  responseLBS ok200 [(hContentType, "application/json; charset=utf-8")] (encode response)
 
-handleEvent :: EventWrapper -> IO Response
-handleEvent e = case eventWrapperEvent e of
-  AppMentionEvent a -> handleAppMention a
+handleEvent :: Config -> EventWrapper -> IO Response
+handleEvent c e = case eventWrapperEvent e of
+  AppMentionEvent a -> handleAppMention c a
 
-handleAppMention :: AppMention -> IO Response
-handleAppMention a = do
-  putStrLn "Received app mention."
-  return $ responseLBS ok200 [] ""
+handleAppMention :: Config -> AppMention -> IO Response
+handleAppMention c a =
+  let mgr = configManager c
+      botToken = configBotToken c
+      response = parrotMessage a
+  in  do
+    BLC.putStrLn $ "Responding with: " <> encode response
+    baseReq <- parseRequest "https://slack.com/api/chat.postMessage"
+    let req = baseReq {
+        method = methodPost
+      , requestBody = RequestBodyLBS (encode response)
+      , requestHeaders = [
+            (hContentType, "application/json; charset=utf-8")
+          , (hAuthorization, "Bearer " <> (Text.encodeUtf8 . getToken $ botToken))
+          ]
+      }
+    postMessageResponse <- httpLbs req mgr
+    print $ responseBody postMessageResponse
+    return $ responseLBS ok200 [] ""
+
+parrotMessage :: AppMention -> AppMentionResponse
+parrotMessage m =
+  let content = appMentionText m
+      channel = appMentionChannel m
+  in  AppMentionResponse channel (parrot content)
+
+parrot :: Text -> Text
+parrot t =
+  let t' = Text.drop 12 t
+  in  case repl parseAllParrot renderParrot t' of
+    Right result -> result
+    Left _       -> case repl parseAllSKI renderSKI t of
+      Right result -> result
+      Left err     -> "Sorry, I couldn't understand that!"
+
+parseMention :: Parser Text
+parseMention = string "<@" *> Atto.takeWhile isAlphaNum <* char '>'

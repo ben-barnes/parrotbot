@@ -1,5 +1,5 @@
 { mkDerivation, aeson, attoparsec, base, bytestring, hedgehog
-, http-types, slack-api, stdenv, text, wai, warp
+, http-client, http-client-tls, http-types, stdenv, text, wai, warp
 }:
 mkDerivation {
   pname = "parrotbot";
@@ -8,9 +8,11 @@ mkDerivation {
   isLibrary = true;
   isExecutable = true;
   libraryHaskellDepends = [
-    aeson attoparsec base bytestring http-types text wai warp
+    aeson attoparsec base bytestring http-client http-types text wai
   ];
-  executableHaskellDepends = [ attoparsec base slack-api text ];
+  executableHaskellDepends = [
+    base http-client http-client-tls warp
+  ];
   testHaskellDepends = [ base hedgehog text ];
   license = stdenv.lib.licenses.publicDomain;
 }
